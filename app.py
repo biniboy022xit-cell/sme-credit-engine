@@ -75,7 +75,9 @@ def show_result(result: dict) -> None:
 
 
 data = load_businesses()
-tab1, tab2, tab3 = st.tabs(["Assess a business", "Enter a business", "Portfolio overview"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Assess a business", "Enter a business", "Portfolio overview", "Ask the assistant"]
+)
 
 with tab1:
     choice = st.selectbox(
@@ -161,3 +163,30 @@ with tab3:
             assessed.sort_values("risk", ascending=False).head(15),
             width="stretch",
         )
+
+with tab4:
+    st.write(
+        "Ask about any business ID (e.g. SME00001). The assistant calls the same "
+        "risk model and asset register as the other tabs — it does not invent numbers, "
+        "and it does not approve or decline anything itself."
+    )
+    question = st.text_input(
+        "Your question",
+        placeholder="Assess SME00001 and tell me if I should be worried.",
+    )
+    if st.button("Ask", key="ask_agent"):
+        if not question.strip():
+            st.warning("Type a question first.")
+        else:
+            try:
+                from agent import run_agent
+                with st.spinner("Calling the model and checking the database..."):
+                    answer = run_agent(question)
+                st.markdown(answer)
+            except KeyError:
+                st.error(
+                    "No GROQ_API_KEY found. Add one to your .env file to use this tab "
+                    "(see .env.example)."
+                )
+            except Exception as e:
+                st.error(f"The assistant could not complete the request: {e}")
