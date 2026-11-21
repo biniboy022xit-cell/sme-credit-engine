@@ -1,14 +1,17 @@
-"""Streamlit dashboard for the synthetic SME credit risk engine."""
+"""Streamlit dashboard for the SME credit risk engine, backed by PostgreSQL."""
 import sys
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sqlalchemy import text
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import scoring  # noqa: E402
+from db import get_engine  # noqa: E402
+from db_scoring import get_business, save_assessment, score_and_save  # noqa: E402
 from features import CATEGORICAL, NUMERIC, add_features  # noqa: E402
 from rules import check_warnings  # noqa: E402
 
@@ -19,28 +22,26 @@ st.warning(
     "from a simulated risk formula. It must not be used for real lending decisions."
 )
 
-RAW_COLS = [
-    "business_id", "business_name", "sector", "years_operating", "monthly_revenue",
-    "monthly_expenses", "revenue_volatility", "revenue_trend_3m", "late_payments_12m",
-    "existing_debt", "loan_amount", "collateral_value", "cash_buffer_days",
-]
 BAND_COLOURS = {"LOW": "green", "MEDIUM": "orange", "HIGH": "red"}
 
 
-@st.cache_data
-def load_data() -> pd.DataFrame:
-    return pd.read_csv("data/smes.csv")
+@st.cache_resource
+def engine():
+    return get_engine()
 
 
-@st.cache_data
-def score_portfolio(df: pd.DataFrame) -> pd.DataFrame:
-    model = scoring._load()
-    feats = add_features(df)
-    out = df.copy()
-    out["risk"] = model.predict_proba(feats[NUMERIC + CATEGORICAL])[:, 1]
-    out["band"] = out["risk"].apply(scoring.band)
-    out["warnings"] = [len(check_warnings(row)) for _, row in feats.iterrows()]
-    return out
+def load_businesses() -> pd.DataFrame:
+    return pd.read_sql("SELECT * FROM businesses ORDER BY business_id", engine())
+
+
+def load_history(business_id: str) -> pd.DataFrame:
+    return pd.read_sql(
+        text("""
+            SELECT assessed_at, probability_of_default, risk_band, suggested_action, warnings
+            FROM assessments WHERE business_id = :bid ORDER BY assessed_at DESC
+        """),
+        engine(), params={"bid": business_id},
+    )
 
 
 def show_result(result: dict) -> None:
@@ -73,7 +74,7 @@ def show_result(result: dict) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
-data = load_data()
+data = load_businesses()
 tab1, tab2, tab3 = st.tabs(["Assess a business", "Enter a business", "Portfolio overview"])
 
 with tab1:
@@ -81,15 +82,33 @@ with tab1:
         "Choose a business",
         data["business_id"] + " - " + data["business_name"],
     )
-    row = data[data["business_id"] == choice.split(" - ")[0]].iloc[0]
+    bid = choice.split(" - ")[0]
+    row = data[data["business_id"] == bid].iloc[0]
     st.caption(
         f"Sector: {row['sector']} | Monthly revenue: ZMW {row['monthly_revenue']:,.0f} | "
         f"Loan requested: ZMW {row['loan_amount']:,.0f}"
     )
-    show_result(scoring.score_business(row[RAW_COLS].to_dict()))
+    if st.button("Score and save to database", key="score_existing"):
+        result = score_and_save(bid)
+        st.session_state["last_result"] = result
+    if "last_result" in st.session_state and st.session_state["last_result"].get("business_name") == row["business_name"]:
+        show_result(st.session_state["last_result"])
+
+    st.divider()
+    st.subheader(f"Assessment history for {row['business_name']}")
+    hist = load_history(bid)
+    if hist.empty:
+        st.info("No assessments saved yet for this business. Click the button above.")
+    else:
+        hist_display = hist.copy()
+        hist_display["probability_of_default"] = hist_display["probability_of_default"].map("{:.1%}".format)
+        st.dataframe(
+            hist_display[["assessed_at", "probability_of_default", "risk_band", "suggested_action"]],
+            width="stretch",
+        )
 
 with tab2:
-    st.write("Type in a business and see how the engine reacts.")
+    st.write("Type in a business, score it, and optionally save the result.")
     a, b, c = st.columns(3)
     sector = a.selectbox("Sector", sorted(data["sector"].unique()))
     years = a.number_input("Years operating", 0, 50, 5)
@@ -108,22 +127,37 @@ with tab2:
         "revenue_trend_3m": trend, "late_payments_12m": late, "existing_debt": debt,
         "loan_amount": loan, "collateral_value": collateral, "cash_buffer_days": buffer_days,
     }
-    show_result(scoring.score_business(manual))
+    result = scoring.score_business(manual)
+    show_result(result)
+    st.caption("This result is not saved unless the business exists in the database.")
 
 with tab3:
-    scored = score_portfolio(data)
-    counts = scored["band"].value_counts().reindex(["LOW", "MEDIUM", "HIGH"]).fillna(0)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Low risk", int(counts["LOW"]))
-    m2.metric("Medium risk", int(counts["MEDIUM"]))
-    m3.metric("High risk", int(counts["HIGH"]))
-    st.plotly_chart(
-        px.histogram(scored, x="risk", nbins=40, title="Distribution of predicted risk"),
-        width="stretch",
-    )
-    st.subheader("Highest-risk businesses")
-    st.dataframe(
-        scored.sort_values("risk", ascending=False)
-        .head(15)[["business_id", "business_name", "sector", "risk", "band", "warnings"]],
-        width="stretch",
-    )
+    scored = pd.read_sql("""
+        SELECT b.business_id, b.business_name, b.sector,
+               a.probability_of_default AS risk, a.risk_band AS band
+        FROM businesses b
+        LEFT JOIN LATERAL (
+            SELECT probability_of_default, risk_band
+            FROM assessments WHERE business_id = b.business_id
+            ORDER BY assessed_at DESC LIMIT 1
+        ) a ON true
+    """, engine())
+    assessed = scored.dropna(subset=["risk"])
+    st.caption(f"{len(assessed)} of {len(scored)} businesses have a saved assessment.")
+    if assessed.empty:
+        st.info("No assessments saved yet. Score some businesses in the first tab.")
+    else:
+        counts = assessed["band"].value_counts().reindex(["LOW", "MEDIUM", "HIGH"]).fillna(0)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Low risk", int(counts["LOW"]))
+        m2.metric("Medium risk", int(counts["MEDIUM"]))
+        m3.metric("High risk", int(counts["HIGH"]))
+        st.plotly_chart(
+            px.histogram(assessed, x="risk", nbins=40, title="Distribution of saved risk scores"),
+            width="stretch",
+        )
+        st.subheader("Highest-risk assessed businesses")
+        st.dataframe(
+            assessed.sort_values("risk", ascending=False).head(15),
+            width="stretch",
+        )
